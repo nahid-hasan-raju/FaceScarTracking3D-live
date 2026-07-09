@@ -150,7 +150,7 @@ def _scan_folder_to_entry(files, scan_folder_id):
         return None
     scan_id = tif["name"].rsplit(".", 1)[0]
     json_file = next((f for f in files if f["name"] == f"{scan_id}_burn_polygons.json"), None)
-    return scan_id, {"id": scan_folder_id, "tif": tif, "json": json_file}
+    return scan_id, {"id": scan_folder_id, "tif": tif, "json": json_file, "files": files}
 
 
 def _build_tree(root_id: str) -> dict:
@@ -327,7 +327,38 @@ def normalize_polygons(raw: dict, scan_id: str, image_size):
     }
 
 
-def load_polygons(scan: dict, scan_id: str, image_size):
+def classify_scan_files(scan: dict):
+    """Return the scan's non-primary files, tagged with how the UI should
+    show each one: seg_image (tif needing conversion), image (png/jpg as-is),
+    mesh_3d (.ply), data (json to pretty-print), other (plain download link).
+    """
+    primary_tif_id = scan["tif"]["id"]
+    primary_json_id = scan["json"]["id"] if scan.get("json") else None
+
+    out = []
+    for f in scan.get("files", []):
+        if f["id"] == primary_tif_id or f["id"] == primary_json_id:
+            continue
+        name_lower = f["name"].lower()
+        if name_lower.endswith(".ply"):
+            category = "mesh_3d"
+        elif name_lower.endswith(".tif") or name_lower.endswith(".tiff"):
+            category = "seg_image"
+        elif name_lower.endswith((".png", ".jpg", ".jpeg")):
+            category = "image"
+        elif name_lower.endswith(".json"):
+            category = "data"
+        else:
+            category = "other"
+        out.append({"id": f["id"], "name": f["name"], "category": category})
+
+    # Stable, readable order: 3D first, then images, then data, then rest.
+    order = {"mesh_3d": 0, "seg_image": 1, "image": 2, "data": 3, "other": 4}
+    out.sort(key=lambda f: (order.get(f["category"], 9), f["name"]))
+    return out
+
+
+
     json_file = scan.get("json")
     if not json_file:
         return {"scan_id": scan_id, "image_size": list(image_size), "regions": []}
