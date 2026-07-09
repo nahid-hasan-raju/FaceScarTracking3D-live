@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<title>{{ patient }} — Timepoints</title>
+<title>{{ patient }} / {{ timepoint }} — Scans</title>
 <style>
   body { font-family: -apple-system, sans-serif; background: #1b1e24; color: #e6e8ec; margin: 0; padding: 24px; }
   .breadcrumb { font-size: 13px; color: #9198a6; margin-bottom: 10px; }
@@ -23,46 +23,45 @@
   a.open-link { color: #4fb2e0; text-decoration: none; font-weight: 600; }
   a.open-link:hover { text-decoration: underline; }
   .badge { font-size: 11px; padding: 2px 8px; border-radius: 10px; white-space: nowrap; }
-  .badge.day0 { background: #4fb2e033; color: #4fb2e0; }
-  .badge.later { background: #38424b; color: #9198a6; }
+  .badge.yes { background: #4fd18b33; color: #4fd18b; }
+  .badge.no { background: #38424b; color: #9198a6; }
   .count { color: #9198a6; font-size: 12px; margin-top: 8px; }
 </style>
 </head>
 <body>
-  <div class="breadcrumb"><a href="/">All Patients</a> / {{ patient }}</div>
-  <h1>{{ patient }} — Timepoints</h1>
-  <p class="sub">{{ timepoints|length }} timepoints found. Click one to see its scans (A/B/C/D...).</p>
+  <div class="breadcrumb"><a href="/">All Patients</a> / <a href="/patient/{{ patient }}">{{ patient }}</a> / {{ timepoint }}</div>
+  <h1>{{ patient }} / {{ timepoint }} — Scans</h1>
+  <p class="sub">{{ scans|length }} scans found. Click one to open the polygon editor.</p>
 
-  <input type="text" id="search" placeholder="Filter by timepoint..." />
+  <input type="text" id="search" placeholder="Filter by scan ID..." />
   <div class="count" id="count"></div>
 
-  <table id="tp-table">
+  <table id="scan-table">
     <thead>
-      <tr><th>Timepoint</th><th>Type</th><th>Scans</th><th></th></tr>
+      <tr><th>Scan</th><th>Polygons</th><th></th></tr>
     </thead>
     <tbody>
-      {% for t in timepoints %}
-      <tr class="row" data-search="{{ t.timepoint }}" onclick="window.location='/patient/{{ patient }}/{{ t.timepoint }}'">
-        <td>{{ t.timepoint }}</td>
-        <td><span class="badge {{ 'day0' if t.is_day0 else 'later' }}">{{ 'Day-0' if t.is_day0 else 'later visit' }}</span></td>
-        <td>{{ t.scan_count }}</td>
-        <td><a class="open-link" href="/patient/{{ patient }}/{{ t.timepoint }}">Open →</a></td>
+      {% for s in scans %}
+      <tr class="row" data-search="{{ s.scan_id }}" onclick="window.location='/edit/{{ s.scan_id }}'">
+        <td>{{ s.scan_id }}</td>
+        <td><span class="badge {{ 'yes' if s.has_polygons else 'no' }}">{{ 'saved' if s.has_polygons else 'none yet' }}</span></td>
+        <td><a class="open-link" href="/edit/{{ s.scan_id }}">Open editor →</a></td>
       </tr>
       {% endfor %}
-      {% if not timepoints %}
-      <tr><td colspan="4" style="color:#9198a6;">No timepoints found for this patient.</td></tr>
+      {% if not scans %}
+      <tr><td colspan="3" style="color:#9198a6;">No scans found for this timepoint.</td></tr>
       {% endif %}
     </tbody>
   </table>
 
   <script>
     const searchBox = document.getElementById("search");
-    const rows = Array.from(document.querySelectorAll("#tp-table tbody tr[data-search]"));
+    const rows = Array.from(document.querySelectorAll("#scan-table tbody tr[data-search]"));
     const countEl = document.getElementById("count");
 
     function updateCount() {
       const visible = rows.filter(r => r.style.display !== "none").length;
-      countEl.textContent = `Showing ${visible} of ${rows.length} timepoints`;
+      countEl.textContent = `Showing ${visible} of ${rows.length} scans`;
     }
     searchBox.addEventListener("input", () => {
       const q = searchBox.value.trim().toLowerCase();
