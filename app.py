@@ -1,77 +1,270 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8" />
-<title>{{ patient }} — Timepoints</title>
-<style>
-  body { font-family: -apple-system, sans-serif; background: #1b1e24; color: #e6e8ec; margin: 0; padding: 24px; }
-  .breadcrumb { font-size: 13px; color: #9198a6; margin-bottom: 10px; }
-  .breadcrumb a { color: #4fb2e0; text-decoration: none; }
-  .breadcrumb a:hover { text-decoration: underline; }
-  h1 { font-size: 18px; margin-bottom: 4px; }
-  p.sub { color: #9198a6; font-size: 13px; margin-top: 0; }
-  input#search {
-    width: 100%; max-width: 360px; margin-top: 14px;
-    background: #23262e; border: 1px solid #383c46; color: #e6e8ec;
-    padding: 8px 10px; border-radius: 6px; font-size: 13px;
-  }
-  input#search:focus { outline: none; border-color: #4fb2e0; }
-  table { width: 100%; border-collapse: collapse; margin-top: 16px; }
-  th, td { text-align: left; padding: 10px; border-bottom: 1px solid #383c46; font-size: 13px; }
-  th { color: #9198a6; text-transform: uppercase; font-size: 11px; letter-spacing: 0.05em; }
-  tr.row:hover { background: #23262e; cursor: pointer; }
-  a.open-link { color: #4fb2e0; text-decoration: none; font-weight: 600; }
-  a.open-link:hover { text-decoration: underline; }
-  .badge { font-size: 11px; padding: 2px 8px; border-radius: 10px; white-space: nowrap; }
-  .badge.day0 { background: #4fb2e033; color: #4fb2e0; }
-  .badge.later { background: #38424b; color: #9198a6; }
-  .count { color: #9198a6; font-size: 12px; margin-top: 8px; }
-</style>
-</head>
-<body>
-  <div class="breadcrumb"><a href="/">All Patients</a> / {{ patient }}</div>
-  <h1>{{ patient }} — Timepoints</h1>
-  <p class="sub">{{ timepoints|length }} timepoints found. Click one to see its scans (A/B/C/D...).</p>
+"""
+Burn Polygon Editor — live version, backed by Google Drive
+=============================================================
 
-  <input type="text" id="search" placeholder="Filter by timepoint..." />
-  <div class="count" id="count"></div>
+Same picker (Patients -> Timepoints -> Scans -> Editor) and same editor UI
+as the local tool, but reads/writes scans and polygon JSON from a Google
+Drive folder instead of a local disk path, so it can run as a normal web
+service instead of `python run_with_picker.py --dataset ...` on your PC.
 
-  <table id="tp-table">
-    <thead>
-      <tr><th>Timepoint</th><th>Type</th><th>Scans</th><th></th></tr>
-    </thead>
-    <tbody>
-      {% for t in timepoints %}
-      <tr class="row" data-search="{{ t.timepoint }}" onclick="window.location='/patient/{{ patient }}/{{ t.timepoint }}'">
-        <td>{{ t.timepoint }}</td>
-        <td><span class="badge {{ 'day0' if t.is_day0 else 'later' }}">{{ 'Day-0' if t.is_day0 else 'later visit' }}</span></td>
-        <td>{{ t.scan_count }}</td>
-        <td><a class="open-link" href="/patient/{{ patient }}/{{ t.timepoint }}">Open →</a></td>
-      </tr>
-      {% endfor %}
-      {% if not timepoints %}
-      <tr><td colspan="4" style="color:#9198a6;">No timepoints found for this patient.</td></tr>
-      {% endif %}
-    </tbody>
-  </table>
+REQUIRED ENVIRONMENT VARIABLES (set these on your host, not in code):
+    GOOGLE_CREDENTIALS_JSON   service account key JSON, as one string
+    DRIVE_ROOT_FOLDER_ID      Drive folder ID of your dataset root
 
-  <script>
-    const searchBox = document.getElementById("search");
-    const rows = Array.from(document.querySelectorAll("#tp-table tbody tr[data-search]"));
-    const countEl = document.getElementById("count");
+See README_DEPLOY.md for the full step-by-step setup.
 
-    function updateCount() {
-      const visible = rows.filter(r => r.style.display !== "none").length;
-      countEl.textContent = `Showing ${visible} of ${rows.length} timepoints`;
-    }
-    searchBox.addEventListener("input", () => {
-      const q = searchBox.value.trim().toLowerCase();
-      rows.forEach(r => {
-        r.style.display = r.getAttribute("data-search").toLowerCase().includes(q) ? "" : "none";
-      });
-      updateCount();
-    });
-    updateCount();
-  </script>
-</body>
-</html>
+Local dev run:
+    export GOOGLE_CREDENTIALS_JSON="$(cat service-account.json)"
+    export DRIVE_ROOT_FOLDER_ID="1AbCxyz..."
+    python app.py
+"""
+
+import io
+import json
+import mimetypes
+import os
+
+from flask import Flask, jsonify, render_template, request, send_file
+
+import drive_storage as ds
+
+app = Flask(__name__, static_folder="static", template_folder="templates")
+
+ROOT_FOLDER_ID = os.environ.get("DRIVE_ROOT_FOLDER_ID")
+
+
+def _require_root_id():
+    if not ROOT_FOLDER_ID:
+        raise RuntimeError("DRIVE_ROOT_FOLDER_ID environment variable is not set")
+    return ROOT_FOLDER_ID
+
+
+@app.route("/healthz")
+def healthz():
+    return jsonify({"status": "ok"})
+
+
+@app.route("/")
+def patients_page():
+    tree = ds.get_tree(_require_root_id())
+    patients = ds.discover_patients(tree)
+    return render_template("patients.html", patients=patients)
+
+
+@app.route("/api/patient/<patient>/scans")
+def api_patient_scans(patient):
+    tree = ds.get_tree(_require_root_id())
+    if patient not in tree:
+        return jsonify({"error": "patient not found"}), 404
+    return jsonify(ds.all_scans_for_patient(tree, patient))
+
+
+@app.route("/api/thumbnail/<scan_id>")
+def api_thumbnail(scan_id):
+    from PIL import Image
+
+    tree = ds.get_tree(_require_root_id())
+    loc = ds.find_scan(tree, scan_id)
+    if loc is None:
+        return jsonify({"error": "scan not found"}), 404
+    _, _, scan = loc
+
+    try:
+        raw = ds.download_file_bytes(scan["tif"]["id"])
+        im = Image.open(io.BytesIO(raw)).convert("RGB")
+    except Exception as e:
+        print(
+            f"[thumbnail] could not load/decode tif for {scan_id!r}: "
+            f"file={scan['tif']['name']!r} id={scan['tif']['id']!r} error={e}"
+        )
+        return jsonify({
+            "error": "could not load or decode this scan's .tif",
+            "file": scan["tif"]["name"],
+        }), 500
+    im.thumbnail((220, 220))
+    buf = io.BytesIO()
+    im.save(buf, format="JPEG", quality=80)
+    buf.seek(0)
+    return send_file(buf, mimetype="image/jpeg")
+
+
+@app.route("/patient/<patient>")
+def timepoints_page(patient):
+    tree = ds.get_tree(_require_root_id())
+    timepoints = ds.discover_timepoints(tree, patient)
+    return render_template("timepoints.html", patient=patient, timepoints=timepoints)
+
+
+@app.route("/patient/<patient>/<timepoint>")
+def scans_page(patient, timepoint):
+    tree = ds.get_tree(_require_root_id())
+    scans = ds.discover_scans_in_timepoint(tree, patient, timepoint)
+    return render_template("scans.html", patient=patient, timepoint=timepoint, scans=scans)
+
+
+@app.route("/edit/<scan_id>")
+def edit(scan_id):
+    tree = ds.get_tree(_require_root_id())
+    loc = ds.find_scan(tree, scan_id)
+    back_url = f"/?patient={loc[0]}" if loc else "/"
+    return render_template(
+        "editor.html",
+        scan_id=scan_id,
+        static_prefix="/static",
+        image_url=f"/api/image/{scan_id}",
+        polygons_url=f"/api/polygons/{scan_id}",
+        polygons_save_url=f"/api/polygons/{scan_id}",
+        back_url=back_url,
+    )
+
+
+@app.route("/api/image/<scan_id>")
+def api_image(scan_id):
+    from PIL import Image
+
+    tree = ds.get_tree(_require_root_id())
+    loc = ds.find_scan(tree, scan_id)
+    if loc is None:
+        return jsonify({"error": "scan not found"}), 404
+    _, _, scan = loc
+
+    try:
+        raw = ds.download_file_bytes(scan["tif"]["id"])
+        im = Image.open(io.BytesIO(raw)).convert("RGB")
+    except Exception as e:
+        print(
+            f"[image] could not load/decode tif for {scan_id!r}: "
+            f"file={scan['tif']['name']!r} id={scan['tif']['id']!r} error={e}"
+        )
+        return jsonify({
+            "error": "could not load or decode this scan's .tif",
+            "file": scan["tif"]["name"],
+        }), 500
+    buf = io.BytesIO()
+    im.save(buf, format="PNG")
+    buf.seek(0)
+    return send_file(buf, mimetype="image/png")
+
+
+@app.route("/api/scan_files/<scan_id>")
+def api_scan_files(scan_id):
+    tree = ds.get_tree(_require_root_id())
+    loc = ds.find_scan(tree, scan_id)
+    if loc is None:
+        return jsonify({"error": "scan not found"}), 404
+    _, _, scan = loc
+    return jsonify(ds.classify_scan_files(scan))
+
+
+def _find_file_in_scan(scan: dict, file_id: str):
+    """Only serve files that actually belong to this scan's folder listing —
+    never an arbitrary Drive file id passed in the URL."""
+    for f in scan.get("files", []):
+        if f["id"] == file_id:
+            return f
+    return None
+
+
+@app.route("/api/raw/<scan_id>/<file_id>")
+def api_raw_file(scan_id, file_id):
+    """Serve a non-primary scan file as-is: png/jpg display natively,
+    json/other files download or open depending on the browser."""
+    tree = ds.get_tree(_require_root_id())
+    loc = ds.find_scan(tree, scan_id)
+    if loc is None:
+        return jsonify({"error": "scan not found"}), 404
+    _, _, scan = loc
+    f = _find_file_in_scan(scan, file_id)
+    if f is None:
+        return jsonify({"error": "file not found on this scan"}), 404
+
+    raw = ds.download_file_bytes(file_id)
+    mime, _ = mimetypes.guess_type(f["name"])
+    return send_file(io.BytesIO(raw), mimetype=mime or "application/octet-stream", download_name=f["name"])
+
+
+@app.route("/api/preview_tif/<scan_id>/<file_id>")
+def api_preview_tif(scan_id, file_id):
+    """Convert a secondary .tif (e.g. the *_seg.tif overlay) to PNG for
+    inline display, same as the main scan image conversion."""
+    from PIL import Image
+
+    tree = ds.get_tree(_require_root_id())
+    loc = ds.find_scan(tree, scan_id)
+    if loc is None:
+        return jsonify({"error": "scan not found"}), 404
+    _, _, scan = loc
+    f = _find_file_in_scan(scan, file_id)
+    if f is None:
+        return jsonify({"error": "file not found on this scan"}), 404
+
+    raw = ds.download_file_bytes(file_id)
+    im = Image.open(io.BytesIO(raw)).convert("RGB")
+    buf = io.BytesIO()
+    im.save(buf, format="PNG")
+    buf.seek(0)
+    return send_file(buf, mimetype="image/png")
+
+
+@app.route("/api/preview_json/<scan_id>/<file_id>")
+def api_preview_json(scan_id, file_id):
+    tree = ds.get_tree(_require_root_id())
+    loc = ds.find_scan(tree, scan_id)
+    if loc is None:
+        return jsonify({"error": "scan not found"}), 404
+    _, _, scan = loc
+    f = _find_file_in_scan(scan, file_id)
+    if f is None:
+        return jsonify({"error": "file not found on this scan"}), 404
+
+    raw = ds.download_file_bytes(file_id)
+    try:
+        return jsonify(json.loads(raw))
+    except Exception:
+        return raw.decode("utf-8", errors="replace"), 200, {"Content-Type": "text/plain"}
+
+
+
+@app.route("/api/polygons/<scan_id>", methods=["GET"])
+def api_get_polygons(scan_id):
+    from PIL import Image
+
+    tree = ds.get_tree(_require_root_id())
+    loc = ds.find_scan(tree, scan_id)
+    if loc is None:
+        return jsonify({"error": "scan not found"}), 404
+    _, _, scan = loc
+
+    try:
+        raw = ds.download_file_bytes(scan["tif"]["id"])
+        with Image.open(io.BytesIO(raw)) as im:
+            size = im.size
+    except Exception as e:
+        print(
+            f"[polygons] could not load/decode tif for {scan_id!r}: "
+            f"file={scan['tif']['name']!r} id={scan['tif']['id']!r} error={e}"
+        )
+        return jsonify({
+            "error": "could not load or decode this scan's .tif",
+            "file": scan["tif"]["name"],
+        }), 500
+    return jsonify(ds.load_polygons(scan, scan_id, size))
+
+
+@app.route("/api/polygons/<scan_id>", methods=["POST"])
+def api_save_polygons(scan_id):
+    tree = ds.get_tree(_require_root_id())
+    loc = ds.find_scan(tree, scan_id)
+    if loc is None:
+        return jsonify({"error": "scan not found"}), 404
+    _, _, scan = loc
+
+    payload = request.get_json(force=True)
+    ds.save_polygons(scan, scan_id, payload)
+    return jsonify({"status": "ok"})
+
+
+if __name__ == "__main__":
+    # Local dev only. In production, gunicorn serves this via the Procfile.
+    port = int(os.environ.get("PORT", 5050))
+    app.run(host="0.0.0.0", port=port, debug=False)
