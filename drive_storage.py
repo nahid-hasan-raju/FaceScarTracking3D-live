@@ -42,7 +42,7 @@ SCOPES = ["https://www.googleapis.com/auth/drive"]
 FOLDER_MIME = "application/vnd.google-apps.folder"
 DAY0_NAMES = {"D00", "D0", "DAY0", "Day0"}
 TREE_TTL_SECONDS = 300
-MAX_WORKERS = 10  # concurrent Drive API calls during a tree walk
+MAX_WORKERS = 6  # concurrent Drive API calls per level during a tree walk
 
 _service = None
 _CACHE = {"tree": None, "ts": 0}
@@ -140,9 +140,7 @@ def _is_day0(name: str) -> bool:
     return name.upper().replace("-", "") in {n.upper() for n in DAY0_NAMES}
 
 
-def _scan_from_folder(scan_folder: dict):
-    """Fetch one scan folder's files and return (scan_id, scan_dict) or None."""
-    files = _list_children(scan_folder["id"])
+def _scan_folder_to_entry(files, scan_folder_id):
     tif = next(
         (f for f in files
          if f["name"].lower().endswith(".tif") and "_seg" not in f["name"].lower()),
@@ -152,44 +150,64 @@ def _scan_from_folder(scan_folder: dict):
         return None
     scan_id = tif["name"].rsplit(".", 1)[0]
     json_file = next((f for f in files if f["name"] == f"{scan_id}_burn_polygons.json"), None)
-    return scan_id, {"id": scan_folder["id"], "tif": tif, "json": json_file}
-
-
-def _timepoint_from_folder(tp_folder: dict):
-    """Fetch one timepoint folder's scans (in parallel) and return (name, dict)."""
-    scan_folders = [c for c in _list_children(tp_folder["id"]) if c["mimeType"] == FOLDER_MIME]
-    scan_map = {}
-    if scan_folders:
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-            for result in pool.map(_scan_from_folder, scan_folders):
-                if result:
-                    scan_id, scan_dict = result
-                    scan_map[scan_id] = scan_dict
-    return tp_folder["name"], {
-        "id": tp_folder["id"],
-        "is_day0": _is_day0(tp_folder["name"]),
-        "scans": scan_map,
-    }
-
-
-def _patient_from_folder(patient_folder: dict):
-    """Fetch one patient folder's timepoints (in parallel) and return (name, dict)."""
-    tp_folders = [c for c in _list_children(patient_folder["id"]) if c["mimeType"] == FOLDER_MIME]
-    tp_map = {}
-    if tp_folders:
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-            for tp_name, tp_dict in pool.map(_timepoint_from_folder, tp_folders):
-                tp_map[tp_name] = tp_dict
-    return patient_folder["name"], {"id": patient_folder["id"], "timepoints": tp_map}
+    return scan_id, {"id": scan_folder_id, "tif": tif, "json": json_file}
 
 
 def _build_tree(root_id: str) -> dict:
-    patient_folders = [c for c in _list_children(root_id) if c["mimeType"] == FOLDER_MIME]
+    """
+    Walk root -> patients -> timepoints -> scans -> files level by level,
+    using ONE bounded thread pool per level (never nested pools — nesting
+    a pool inside a pool inside a pool can spawn hundreds of threads at
+    once on a larger dataset and exhaust memory on a small instance).
+    """
     tree = {}
-    if patient_folders:
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-            for patient_name, patient_dict in pool.map(_patient_from_folder, patient_folders):
-                tree[patient_name] = patient_dict
+
+    # Level 1: patients (single call, no pool needed)
+    patient_folders = [c for c in _list_children(root_id) if c["mimeType"] == FOLDER_MIME]
+    for pf in patient_folders:
+        tree[pf["name"]] = {"id": pf["id"], "timepoints": {}}
+    if not patient_folders:
+        return tree
+
+    # Level 2: timepoints for every patient, in parallel (bounded)
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        tp_children_lists = list(pool.map(lambda p: _list_children(p["id"]), patient_folders))
+
+    tp_jobs = []  # (patient_name, tp_folder)
+    for pf, children in zip(patient_folders, tp_children_lists):
+        for tp in children:
+            if tp["mimeType"] != FOLDER_MIME:
+                continue
+            tree[pf["name"]]["timepoints"][tp["name"]] = {
+                "id": tp["id"], "is_day0": _is_day0(tp["name"]), "scans": {},
+            }
+            tp_jobs.append((pf["name"], tp))
+    if not tp_jobs:
+        return tree
+
+    # Level 3: scans for every timepoint, in parallel (bounded)
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        scan_children_lists = list(pool.map(lambda job: _list_children(job[1]["id"]), tp_jobs))
+
+    scan_jobs = []  # (patient_name, tp_name, scan_folder)
+    for (patient_name, tp_folder), children in zip(tp_jobs, scan_children_lists):
+        for scan in children:
+            if scan["mimeType"] != FOLDER_MIME:
+                continue
+            scan_jobs.append((patient_name, tp_folder["name"], scan))
+    if not scan_jobs:
+        return tree
+
+    # Level 4: files for every scan folder, in parallel (bounded)
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        file_lists = list(pool.map(lambda job: _list_children(job[2]["id"]), scan_jobs))
+
+    for (patient_name, tp_name, scan_folder), files in zip(scan_jobs, file_lists):
+        entry = _scan_folder_to_entry(files, scan_folder["id"])
+        if entry:
+            scan_id, scan_dict = entry
+            tree[patient_name]["timepoints"][tp_name]["scans"][scan_id] = scan_dict
+
     return tree
 
 
