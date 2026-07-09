@@ -70,7 +70,19 @@ def api_thumbnail(scan_id):
     _, _, scan = loc
 
     raw = ds.download_file_bytes(scan["tif"]["id"])
-    im = Image.open(io.BytesIO(raw)).convert("RGB")
+    try:
+        im = Image.open(io.BytesIO(raw)).convert("RGB")
+    except Exception as e:
+        print(
+            f"[thumbnail] could not decode tif for {scan_id!r}: "
+            f"file={scan['tif']['name']!r} id={scan['tif']['id']!r} "
+            f"bytes={len(raw)} first16={raw[:16]!r} error={e}"
+        )
+        return jsonify({
+            "error": "could not decode this scan's .tif as an image",
+            "file": scan["tif"]["name"],
+            "bytes_downloaded": len(raw),
+        }), 500
     im.thumbnail((220, 220))
     buf = io.BytesIO()
     im.save(buf, format="JPEG", quality=80)
@@ -119,7 +131,19 @@ def api_image(scan_id):
     _, _, scan = loc
 
     raw = ds.download_file_bytes(scan["tif"]["id"])
-    im = Image.open(io.BytesIO(raw)).convert("RGB")
+    try:
+        im = Image.open(io.BytesIO(raw)).convert("RGB")
+    except Exception as e:
+        print(
+            f"[image] could not decode tif for {scan_id!r}: "
+            f"file={scan['tif']['name']!r} id={scan['tif']['id']!r} "
+            f"bytes={len(raw)} first16={raw[:16]!r} error={e}"
+        )
+        return jsonify({
+            "error": "could not decode this scan's .tif as an image",
+            "file": scan["tif"]["name"],
+            "bytes_downloaded": len(raw),
+        }), 500
     buf = io.BytesIO()
     im.save(buf, format="PNG")
     buf.seek(0)
@@ -205,6 +229,7 @@ def api_preview_json(scan_id, file_id):
 
 
 
+@app.route("/api/polygons/<scan_id>", methods=["GET"])
 def api_get_polygons(scan_id):
     from PIL import Image
 
