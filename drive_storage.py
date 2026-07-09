@@ -30,7 +30,9 @@ after a save (see invalidate()).
 import io
 import json
 import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -39,21 +41,19 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 FOLDER_MIME = "application/vnd.google-apps.folder"
 DAY0_NAMES = {"D00", "D0", "DAY0", "Day0"}
-TREE_TTL_SECONDS = 20
+TREE_TTL_SECONDS = 300
+MAX_WORKERS = 10  # concurrent Drive API calls during a tree walk
 
 _service = None
 _CACHE = {"tree": None, "ts": 0}
+_thread_local = threading.local()
 
 
 # ---------------------------------------------------------------------------
 # Auth / low-level Drive helpers
 # ---------------------------------------------------------------------------
 
-def get_service():
-    global _service
-    if _service is not None:
-        return _service
-
+def _build_service():
     creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
     creds_path = os.environ.get("GOOGLE_CREDENTIALS_FILE")
 
@@ -67,9 +67,18 @@ def get_service():
             "No Google credentials found. Set GOOGLE_CREDENTIALS_JSON (the service "
             "account key as one JSON string) or GOOGLE_CREDENTIALS_FILE (a path)."
         )
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
 
-    _service = build("drive", "v3", credentials=creds, cache_discovery=False)
-    return _service
+
+def get_service():
+    """One Drive service instance per thread — the googleapiclient http
+    object underneath isn't safe to share across threads, and the tree
+    walk below runs many folder listings concurrently."""
+    svc = getattr(_thread_local, "service", None)
+    if svc is None:
+        svc = _build_service()
+        _thread_local.service = svc
+    return svc
 
 
 def _list_children(folder_id):
@@ -131,38 +140,56 @@ def _is_day0(name: str) -> bool:
     return name.upper().replace("-", "") in {n.upper() for n in DAY0_NAMES}
 
 
+def _scan_from_folder(scan_folder: dict):
+    """Fetch one scan folder's files and return (scan_id, scan_dict) or None."""
+    files = _list_children(scan_folder["id"])
+    tif = next(
+        (f for f in files
+         if f["name"].lower().endswith(".tif") and "_seg" not in f["name"].lower()),
+        None,
+    )
+    if not tif:
+        return None
+    scan_id = tif["name"].rsplit(".", 1)[0]
+    json_file = next((f for f in files if f["name"] == f"{scan_id}_burn_polygons.json"), None)
+    return scan_id, {"id": scan_folder["id"], "tif": tif, "json": json_file}
+
+
+def _timepoint_from_folder(tp_folder: dict):
+    """Fetch one timepoint folder's scans (in parallel) and return (name, dict)."""
+    scan_folders = [c for c in _list_children(tp_folder["id"]) if c["mimeType"] == FOLDER_MIME]
+    scan_map = {}
+    if scan_folders:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            for result in pool.map(_scan_from_folder, scan_folders):
+                if result:
+                    scan_id, scan_dict = result
+                    scan_map[scan_id] = scan_dict
+    return tp_folder["name"], {
+        "id": tp_folder["id"],
+        "is_day0": _is_day0(tp_folder["name"]),
+        "scans": scan_map,
+    }
+
+
+def _patient_from_folder(patient_folder: dict):
+    """Fetch one patient folder's timepoints (in parallel) and return (name, dict)."""
+    tp_folders = [c for c in _list_children(patient_folder["id"]) if c["mimeType"] == FOLDER_MIME]
+    tp_map = {}
+    if tp_folders:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            for tp_name, tp_dict in pool.map(_timepoint_from_folder, tp_folders):
+                tp_map[tp_name] = tp_dict
+    return patient_folder["name"], {"id": patient_folder["id"], "timepoints": tp_map}
+
+
 def _build_tree(root_id: str) -> dict:
+    patient_folders = [c for c in _list_children(root_id) if c["mimeType"] == FOLDER_MIME]
     tree = {}
-    for patient in _list_children(root_id):
-        if patient["mimeType"] != FOLDER_MIME:
-            continue
-        tp_map = {}
-        for tp in _list_children(patient["id"]):
-            if tp["mimeType"] != FOLDER_MIME:
-                continue
-            scan_map = {}
-            for scan in _list_children(tp["id"]):
-                if scan["mimeType"] != FOLDER_MIME:
-                    continue
-                files = _list_children(scan["id"])
-                tif = next(
-                    (f for f in files
-                     if f["name"].lower().endswith(".tif") and "_seg" not in f["name"].lower()),
-                    None,
-                )
-                if not tif:
-                    continue
-                scan_id = tif["name"].rsplit(".", 1)[0]
-                json_file = next(
-                    (f for f in files if f["name"] == f"{scan_id}_burn_polygons.json"), None
-                )
-                scan_map[scan_id] = {"id": scan["id"], "tif": tif, "json": json_file}
-            tp_map[tp["name"]] = {
-                "id": tp["id"],
-                "is_day0": _is_day0(tp["name"]),
-                "scans": scan_map,
-            }
-        tree[patient["name"]] = {"id": patient["id"], "timepoints": tp_map}
+    if patient_folders:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            for patient_name, patient_dict in pool.map(_patient_from_folder, patient_folders):
+                tree[patient_name] = patient_dict
     return tree
 
 
