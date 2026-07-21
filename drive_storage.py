@@ -175,17 +175,61 @@ def _is_day0(name: str) -> bool:
     return name.upper().replace("-", "") in {n.upper() for n in DAY0_NAMES}
 
 
-def _scan_folder_to_entry(files, scan_folder_id):
-    tif = next(
-        (f for f in files
-         if f["name"].lower().endswith(".tif") and "_seg" not in f["name"].lower()),
-        None,
-    )
-    if not tif:
+# Fixed naming convention observed across scan folders:
+#   {scan_id}.tif             -> original
+#   {scan_id}_normalized.tif  -> normalized
+#   {scan_id}_seg.tif         -> seg (segmentation overlay)
+# Listed in the order they should appear in any UI dropdown.
+VARIANT_SUFFIXES = [
+    ("original", ""),
+    ("normalized", "_normalized"),
+    ("seg", "_seg"),
+]
+VARIANT_ORDER = [name for name, _ in VARIANT_SUFFIXES]
+
+
+def _scan_folder_to_entry(files, scan_folder):
+    """scan_folder is the Drive folder dict ({id, name, mimeType}) for this
+    scan -- its name IS the scan_id (e.g. 'PAT01_D14_A'), which is far more
+    reliable than trying to derive scan_id from whichever tif happens to be
+    picked. Each variant is matched by an EXACT filename, not a substring
+    guess, so an original and a normalized tif sitting side by side can
+    never be confused with each other."""
+    scan_id = scan_folder["name"]
+    scan_folder_id = scan_folder["id"]
+
+    by_name = {f["name"].lower(): f for f in files}
+
+    variants = {}
+    for variant_name, suffix in VARIANT_SUFFIXES:
+        for ext in (".tif", ".tiff"):
+            target = f"{scan_id}{suffix}{ext}".lower()
+            f = by_name.get(target)
+            if f:
+                variants[variant_name] = f
+                break
+
+    original = variants.get("original")
+    if not original:
+        # Fallback for scans that don't exactly match "{scan_id}.tif" --
+        # better to show something than to silently drop the scan.
+        original = next(
+            (f for f in files
+             if f["name"].lower().endswith((".tif", ".tiff"))
+             and "_seg" not in f["name"].lower()
+             and "_normalized" not in f["name"].lower()),
+            None,
+        )
+        if original:
+            variants["original"] = original
+    if not original:
         return None
-    scan_id = tif["name"].rsplit(".", 1)[0]
+
     json_file = next((f for f in files if f["name"] == f"{scan_id}_burn_polygons.json"), None)
-    return scan_id, {"id": scan_folder_id, "tif": tif, "json": json_file, "files": files}
+    return scan_id, {
+        "id": scan_folder_id, "tif": original, "json": json_file,
+        "files": files, "variants": variants,
+    }
 
 
 def _build_tree(root_id: str) -> dict:
@@ -238,7 +282,7 @@ def _build_tree(root_id: str) -> dict:
         file_lists = list(pool.map(lambda job: _list_children(job[2]["id"]), scan_jobs))
 
     for (patient_name, tp_name, scan_folder), files in zip(scan_jobs, file_lists):
-        entry = _scan_folder_to_entry(files, scan_folder["id"])
+        entry = _scan_folder_to_entry(files, scan_folder)
         if entry:
             scan_id, scan_dict = entry
             tree[patient_name]["timepoints"][tp_name]["scans"][scan_id] = scan_dict
@@ -329,11 +373,13 @@ def all_scans_for_patient(tree: dict, patient_name: str):
     out = []
     for tp_name, tp in patient["timepoints"].items():
         for scan_id, scan in tp["scans"].items():
+            available = scan.get("variants") or {}
             out.append({
                 "timepoint": tp_name,
                 "is_day0": tp["is_day0"],
                 "scan_id": scan_id,
                 "has_polygons": scan["json"] is not None,
+                "variants": [v for v in VARIANT_ORDER if v in available],
             })
     out.sort(key=lambda s: (not s["is_day0"], s["timepoint"], s["scan_id"]))
     return out
